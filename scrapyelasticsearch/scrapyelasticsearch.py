@@ -25,6 +25,9 @@ import hashlib
 import types
 
 
+logger = logging.getLogger(__name__)
+
+
 class InvalidSettingsException(Exception):
     pass
 
@@ -66,6 +69,10 @@ class ElasticSearchPipeline(object):
                                    timeout=ext.settings.get('ELASTICSEARCH_TIMEOUT',60))
         else :
             ext.es = Elasticsearch(hosts=es_servers, timeout=ext.settings.get('ELASTICSEARCH_TIMEOUT', 60))
+
+        ext.buffer_length = int(ext.settings.get('ELASTICSEARCH_BUFFER_SIZE', 500))
+        ext.flush_size = int(ext.settings.get('ELASTICSEARCH_FLUSH_SIZE', 2000))
+        ext.nsent = 0
         return ext
 
     def get_unique_key(self, unique_key):
@@ -105,16 +112,29 @@ class ElasticSearchPipeline(object):
             unique_key = self.get_unique_key(item_unique_key)
             item_id = hashlib.sha1(unique_key).hexdigest()
             index_action['_id'] = item_id
-            logging.debug('Generated unique key %s' % item_id)
+            logger.debug('Generated unique key %s' % item_id)
 
         self.items_buffer.append(index_action)
 
-        if len(self.items_buffer) >= self.settings.get('ELASTICSEARCH_BUFFER_LENGTH', 500):
+        if len(self.items_buffer) >= self.buffer_length:
             self.send_items()
+            self.nsent += len(self.items_buffer)
             self.items_buffer = []
 
+        if self.nsent >= self.flush_size:
+            self.flush()
+            self.nsent = 0
+
     def send_items(self):
+        # TODO: evaluate result
         helpers.bulk(self.es, self.items_buffer)
+        logger.info('Sent %d items to index %s' %
+            (self.buffer_length, self.settings['ELASTICSEARCH_INDEX']))
+
+    def flush(self):
+        # TODO: evaluate result
+        self.es.indices.flush(index=self.settings['ELASTICSEARCH_INDEX'])
+        logger.info('Flushed index %s' % self.settings['ELASTICSEARCH_INDEX'])
 
     def process_item(self, item, spider):
         if isinstance(item, types.GeneratorType) or isinstance(item, list):
@@ -122,10 +142,11 @@ class ElasticSearchPipeline(object):
                 self.process_item(each, spider)
         else:
             self.index_item(item)
-            logging.debug('Item sent to Elastic Search %s' % self.settings['ELASTICSEARCH_INDEX'])
+            logger.debug('Item sent to Elastic Search %s' % self.settings['ELASTICSEARCH_INDEX'])
             return item
 
     def close_spider(self, spider):
         if len(self.items_buffer):
             self.send_items()
+        self.flush()
 
